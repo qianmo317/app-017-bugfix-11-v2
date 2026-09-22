@@ -1,15 +1,16 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import type { Doc } from '../types';
 import { listDocs, saveDoc, deleteDoc, newDoc } from '../lib/storage';
 import { navigate } from '../router';
 
 export default function HomePage() {
   const [docs, setDocs] = useState<Doc[] | null>(null);
+  const [failingId, setFailingId] = useState<string | null>(null);
 
-  const refresh = () => listDocs().then(setDocs);
+  const refresh = useCallback(() => listDocs().then(setDocs), []);
   useEffect(() => {
     refresh();
-  }, []);
+  }, [refresh]);
 
   const createDoc = () => {
     const doc = newDoc({ title: `文档 ${new Date().toLocaleDateString('zh-CN')}` });
@@ -17,7 +18,16 @@ export default function HomePage() {
   };
 
   const remove = async (id: string) => {
+    // 乐观删除：先从列表移除，落库失败再刷新回滚
+    const previous = docs;
     setDocs((prev) => (prev ? prev.filter((d) => d.id !== id) : prev));
+    try {
+      await deleteDoc(id);
+      setFailingId(null);
+    } catch {
+      setFailingId(id);
+      setDocs(previous);
+    }
   };
 
   return (
@@ -58,6 +68,11 @@ export default function HomePage() {
             </li>
           ))}
         </ul>
+      )}
+      {failingId && (
+        <p className="violation-item" role="alert">
+          删除失败，请重试。
+        </p>
       )}
       <section style={{ marginTop: 24 }}>
         <h2>这是什么？</h2>

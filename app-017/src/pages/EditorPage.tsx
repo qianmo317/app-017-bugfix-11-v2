@@ -22,33 +22,84 @@ export default function EditorPage({ id }: { id: string }) {
   const [selectedCell, setSelectedCell] = useState<BrailleCell | null>(null);
   const [customReading, setCustomReading] = useState('');
   const [liveMsg, setLiveMsg] = useState('');
-  const [savedAt, setSavedAt] = useState<number | null>(null);
+  const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  const latestDoc = useRef<Doc | null>(null);
   const saveTimer = useRef<number | undefined>(undefined);
+  const saveSeq = useRef(0);
+
+  // 立即把未落库的内容写入 IndexedDB（切文档 / 离开页面 / 关闭标签时）
+  const flushSave = useCallback(async () => {
+    if (saveTimer.current !== undefined) {
+      window.clearTimeout(saveTimer.current);
+      saveTimer.current = undefined;
+    }
+    const pending = latestDoc.current;
+    if (!pending) return;
+    latestDoc.current = null;
+    await saveDoc(pending);
+  }, []);
 
   useEffect(() => {
     let alive = true;
+    // 切换文档时先把上一份文档的待写内容落库
+    void flushSave();
+    saveSeq.current += 1; // 作废旧文档尚未完成的保存回调
+    setSaveState('idle');
     getDoc(id).then((d) => {
       if (!alive) return;
-      if (d) setDoc(d);
-      else setNotFound(true);
+      if (d) {
+        setDoc(d);
+        latestDoc.current = d;
+      } else setNotFound(true);
     });
     return () => {
       alive = false;
     };
-  }, [id]);
+  }, [id, flushSave]);
 
-  const persist = useCallback((next: Doc) => {
-    saveDoc(next);
-  }, []);
+  useEffect(() => {
+    const onBeforeUnload = () => {
+      void flushSave();
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => {
+      window.removeEventListener('beforeunload', onBeforeUnload);
+      void flushSave();
+    };
+  }, [flushSave]);
 
-  const patchDoc = useCallback((patch: Partial<Doc>) => {
-    setDoc((prev) => {
-      if (!prev) return prev;
-      const next = { ...prev, ...patch };
-      persist(next);
-      return next;
-    });
-  }, [persist]);
+  const scheduleSave = useCallback(
+    (next: Doc) => {
+      setSaveState('saving');
+      if (saveTimer.current !== undefined) window.clearTimeout(saveTimer.current);
+      saveTimer.current = window.setTimeout(() => {
+        saveTimer.current = undefined;
+        const seq = ++saveSeq.current;
+        saveDoc(next)
+          .then(() => {
+            if (seq === saveSeq.current) setSaveState('saved');
+          })
+          .catch(() => {
+            if (seq === saveSeq.current) setSaveState('error');
+          });
+      }, 400);
+    },
+    [],
+  );
+
+  const patchDoc = useCallback(
+    (patch: Partial<Doc>) => {
+      const next: Doc = {
+        ...(latestDoc.current as Doc),
+        ...patch,
+        updatedAt: Date.now(),
+      };
+      latestDoc.current = next;
+      setDoc(next);
+      scheduleSave(next);
+    },
+    [scheduleSave],
+  );
 
   const convertOptions = useMemo(
     () => ({
@@ -138,8 +189,8 @@ export default function EditorPage({ id }: { id: string }) {
             aria-label="文档标题"
           />
         </label>
-        <span className="stats" role="status">
-          {savedAt ? '已保存' : ''}
+        <span className="stats" role="status" aria-live="polite">
+          {saveState === 'saving' ? '保存中…' : saveState === 'saved' ? '已保存' : saveState === 'error' ? '保存失败' : ''}
         </span>
         <button
           type="button"
