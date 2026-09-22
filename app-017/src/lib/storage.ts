@@ -7,19 +7,25 @@ const DB_NAME = 'braille-studio';
 const DB_VERSION = 1;
 const STORE = 'docs';
 
+let dbPromise: Promise<IDBDatabase> | null = null;
+
+/** 复用同一个连接，避免每次读写都 open/close（连续输入时开销显著）。 */
 function openDB(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
-    req.onupgradeneeded = () => {
-      const db = req.result;
-      if (!db.objectStoreNames.contains(STORE)) {
-        const store = db.createObjectStore(STORE, { keyPath: 'id' });
-        store.createIndex('updatedAt', 'updatedAt');
-      }
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error ?? new Error('IndexedDB 打开失败'));
-  });
+  if (!dbPromise) {
+    dbPromise = new Promise((resolve, reject) => {
+      const req = indexedDB.open(DB_NAME, DB_VERSION);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(STORE)) {
+          const store = db.createObjectStore(STORE, { keyPath: 'id' });
+          store.createIndex('updatedAt', 'updatedAt');
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error ?? new Error('IndexedDB 打开失败'));
+    });
+  }
+  return dbPromise;
 }
 
 function withStore<T>(mode: IDBTransactionMode, fn: (store: IDBObjectStore) => IDBRequest<T>): Promise<T> {
@@ -30,7 +36,6 @@ function withStore<T>(mode: IDBTransactionMode, fn: (store: IDBObjectStore) => I
         const req = fn(tx.objectStore(STORE));
         req.onsuccess = () => resolve(req.result);
         req.onerror = () => reject(req.error ?? new Error('IndexedDB 操作失败'));
-        tx.oncomplete = () => db.close();
       }),
   );
 }
@@ -43,17 +48,9 @@ export async function getDoc(id: string): Promise<Doc | undefined> {
   return withStore<Doc | undefined>('readonly', (s) => s.get(id) as IDBRequest<Doc | undefined>);
 }
 
+/** 整文档写入：Doc 的全部字段（含 setup / overrides / confirmed / ruleProfile）都必须落库。 */
 export async function saveDoc(doc: Doc): Promise<void> {
-  const existing = await getDoc(doc.id);
-  const merged = {
-    ...(existing ?? doc),
-    id: doc.id,
-    title: doc.title,
-    raw: doc.raw,
-    cells: doc.cells,
-    updatedAt: doc.updatedAt,
-  };
-  await withStore('readwrite', (s) => s.put(merged));
+  await withStore('readwrite', (s) => s.put(doc));
 }
 
 export async function deleteDoc(id: string): Promise<void> {

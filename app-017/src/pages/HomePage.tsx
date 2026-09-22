@@ -6,7 +6,7 @@ import { navigate } from '../router';
 export default function HomePage() {
   const [docs, setDocs] = useState<Doc[] | null>(null);
 
-  const refresh = () => listDocs().then(setDocs);
+  const refresh = () => listDocs().then((all) => setDocs([...all].sort((a, b) => b.updatedAt - a.updatedAt)));
   useEffect(() => {
     refresh();
   }, []);
@@ -17,7 +17,8 @@ export default function HomePage() {
   };
 
   const remove = async (id: string) => {
-    setDocs((prev) => (prev ? prev.filter((d) => d.id !== id) : prev));
+    await deleteDoc(id);
+    await refresh();
   };
 
   return (

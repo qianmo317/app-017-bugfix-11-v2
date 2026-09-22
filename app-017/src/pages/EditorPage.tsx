@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, useDeferredValue } from 'react';
 import type { BrailleCell, Doc } from '../types';
 import { convertText } from '../lib/convert';
 import { layoutDocument } from '../lib/layout';
@@ -23,52 +23,98 @@ export default function EditorPage({ id }: { id: string }) {
   const [customReading, setCustomReading] = useState('');
   const [liveMsg, setLiveMsg] = useState('');
   const [savedAt, setSavedAt] = useState<number | null>(null);
+  const [saveError, setSaveError] = useState(false);
   const saveTimer = useRef<number | undefined>(undefined);
+  const latestDoc = useRef<Doc | null>(null);
+  const pendingDoc = useRef<Doc | null>(null);
+  const mounted = useRef(true);
 
   useEffect(() => {
     let alive = true;
     getDoc(id).then((d) => {
       if (!alive) return;
-      if (d) setDoc(d);
-      else setNotFound(true);
+      if (d) {
+        setDoc(d);
+        latestDoc.current = d;
+      } else setNotFound(true);
     });
     return () => {
       alive = false;
     };
   }, [id]);
 
-  const persist = useCallback((next: Doc) => {
-    saveDoc(next);
+  const flushSave = useCallback(async () => {
+    const toSave = pendingDoc.current;
+    if (!toSave) return;
+    pendingDoc.current = null;
+    try {
+      await saveDoc(toSave);
+      if (mounted.current) {
+        setSavedAt(Date.now());
+        setSaveError(false);
+      }
+    } catch (err) {
+      // 写失败时保留待存内容并提示，避免静默丢失（不覆盖期间产生的更新版本）
+      pendingDoc.current = pendingDoc.current ?? toSave;
+      if (mounted.current) setSaveError(true);
+      console.error('文档保存失败', err);
+    }
   }, []);
 
+  // 连续编辑只调度一次防抖写库；离开页面前把未落盘的内容写完
+  useEffect(() => {
+    mounted.current = true;
+    const onPageHide = () => {
+      void flushSave();
+    };
+    window.addEventListener('pagehide', onPageHide);
+    return () => {
+      mounted.current = false;
+      window.removeEventListener('pagehide', onPageHide);
+      window.clearTimeout(saveTimer.current);
+      void flushSave();
+    };
+  }, [flushSave]);
+
+  const scheduleSave = useCallback((next: Doc) => {
+    pendingDoc.current = next;
+    window.clearTimeout(saveTimer.current);
+    saveTimer.current = window.setTimeout(() => {
+      void flushSave();
+    }, 500);
+  }, [flushSave]);
+
   const patchDoc = useCallback((patch: Partial<Doc>) => {
-    setDoc((prev) => {
-      if (!prev) return prev;
-      const next = { ...prev, ...patch };
-      persist(next);
-      return next;
-    });
-  }, [persist]);
+    const prev = latestDoc.current;
+    if (!prev) return;
+    const next = { ...prev, ...patch, updatedAt: Date.now() };
+    latestDoc.current = next;
+    setDoc(next);
+    scheduleSave(next);
+  }, [scheduleSave]);
+
+  // 输入即时反映在文本框；转换/排版这类重活延后到空闲帧，长文档连打也不卡
+  const deferredDoc = useDeferredValue(doc);
 
   const convertOptions = useMemo(
     () => ({
       toneMode: settings.toneMode,
       autoDetectPinyin: settings.autoDetectPinyin,
-      profile: doc?.ruleProfile ?? 'zh-current',
-      overrides: doc?.overrides,
-      confirmed: doc?.confirmed,
+      profile: deferredDoc?.ruleProfile ?? 'zh-current',
+      overrides: deferredDoc?.overrides,
+      confirmed: deferredDoc?.confirmed,
       dictEntries: settings.dictEntries,
     }),
-    [settings.toneMode, settings.autoDetectPinyin, settings.dictEntries, doc?.ruleProfile, doc?.overrides, doc?.confirmed],
+    [settings.toneMode, settings.autoDetectPinyin, settings.dictEntries, deferredDoc?.ruleProfile, deferredDoc?.overrides, deferredDoc?.confirmed],
   );
 
   const converted = useMemo(
-    () => (doc ? convertText(doc.raw, convertOptions) : null),
-    [doc?.raw, convertOptions],
+    () => (deferredDoc ? convertText(deferredDoc.raw, convertOptions) : null),
+    [deferredDoc?.raw, convertOptions],
   );
   const layout = useMemo(
-    () => (converted && doc ? layoutDocument(converted.paragraphs, doc.setup, settings.showPageNumbers) : null),
-    [converted, doc?.setup, settings.showPageNumbers],
+    () => (converted && deferredDoc ? layoutDocument(converted.paragraphs, deferredDoc.setup, settings.showPageNumbers) : null),
+    [converted, deferredDoc?.setup, settings.showPageNumbers],
   );
 
   // 预览行号反查：选中格 → 原字符
@@ -119,6 +165,13 @@ export default function EditorPage({ id }: { id: string }) {
   }
   if (!doc || !converted || !layout) return <p>加载中…</p>;
 
+  // 离开编辑器前先把防抖中的未保存内容落盘，避免回到首页看到旧时间/旧内容
+  const leave = async (path: string) => {
+    window.clearTimeout(saveTimer.current);
+    await flushSave();
+    navigate(path);
+  };
+
   const uncertainCount = converted.uncertain.length;
   const hasViolations = layout.violations.length > 0;
   const exportBlocked = uncertainCount > 0;
@@ -126,7 +179,7 @@ export default function EditorPage({ id }: { id: string }) {
   return (
     <div>
       <div className="editor-header">
-        <button type="button" onClick={() => navigate('/')}>
+        <button type="button" onClick={() => void leave('/')}>
           ← 首页
         </button>
         <label style={{ margin: 0, flex: 1 }}>
@@ -139,14 +192,14 @@ export default function EditorPage({ id }: { id: string }) {
           />
         </label>
         <span className="stats" role="status">
-          {savedAt ? '已保存' : ''}
+          {saveError ? '保存失败，将自动重试' : savedAt ? '已保存' : ''}
         </span>
         <button
           type="button"
           className="primary"
           disabled={exportBlocked}
           title={exportBlocked ? '存在未确认的读音，确认后才能导出' : '进入打印与导出'}
-          onClick={() => navigate(`/editor/${doc.id}/print`)}
+          onClick={() => void leave(`/editor/${doc.id}/print`)}
         >
           打印与导出 →
         </button>

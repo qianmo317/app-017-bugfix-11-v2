@@ -1,3 +1,4 @@
+/// <reference types="vitest/config" />
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
@@ -8,5 +9,9 @@ export default defineConfig({
   build: {
     target: 'es2020',
     chunkSizeWarningLimit: 1200,
+  },
+  test: {
+    // e2e/ 由 Playwright 运行（npm run e2e），vitest 只跑 tests/
+    exclude: ['e2e/**', 'node_modules/**'],
   },
 });
